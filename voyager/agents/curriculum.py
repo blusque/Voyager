@@ -2,22 +2,28 @@ from __future__ import annotations
 
 import random
 import re
+from typing import Any
 
 import voyager.utils as U
 from voyager.prompts import load_prompt
 from voyager.utils.json_utils import fix_and_parse_json
-from langchain.chat_models import ChatOpenAI
-from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain.schema import HumanMessage, SystemMessage
-from langchain.vectorstores import Chroma
+from langchain_chroma import Chroma
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_qwq import ChatQwen
+from voyager.utils.telemetry import ensure_posthog_compat
+
+ensure_posthog_compat()
+
+logger = U.get_logger(__name__)
 
 
 class CurriculumAgent:
     def __init__(
         self,
-        model_name="gpt-3.5-turbo",
+        model_name="qwen-plus",
         temperature=0,
-        qa_model_name="gpt-3.5-turbo",
+        qa_model_name="qwen-plus",
         qa_temperature=0,
         request_timout=120,
         ckpt_dir="ckpt",
@@ -26,16 +32,39 @@ class CurriculumAgent:
         warm_up=None,
         core_inventory_items: str | None = None,
     ):
-        self.llm = ChatOpenAI(
-            model_name=model_name,
-            temperature=temperature,
-            request_timeout=request_timout,
-        )
-        self.qa_llm = ChatOpenAI(
-            model_name=qa_model_name,
-            temperature=qa_temperature,
-            request_timeout=request_timout,
-        )
+        if re.search(r"^qwen-", model_name):
+            logger.info(
+                f"\033[32mUsing Qwen model {model_name} for Action Agent\033[0m"
+            )
+            self.llm = ChatQwen(
+                model_name=model_name,
+                temperature=temperature,
+                request_timeout=request_timout,
+            )
+            self.qa_llm = ChatQwen(
+                model_name=qa_model_name,
+                temperature=qa_temperature,
+                request_timeout=request_timout,
+            )
+        elif re.search(r"^gpt-", model_name):
+            logger.info(
+                f"\033[32mUsing GPT model {model_name} for Action Agent\033[0m"
+            )
+            self.llm = ChatOpenAI(
+                model_name=model_name,
+                temperature=temperature,
+                request_timeout=request_timout,
+            )
+            self.qa_llm = ChatOpenAI(
+                model_name=qa_model_name,
+                temperature=qa_temperature,
+                request_timeout=request_timout,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported model name {model_name} for Action Agent. "
+                "Please use a QwQ or GPT model."
+            )
         assert mode in [
             "auto",
             "manual",
@@ -44,7 +73,7 @@ class CurriculumAgent:
         self.ckpt_dir = ckpt_dir
         U.f_mkdir(f"{ckpt_dir}/curriculum/vectordb")
         if resume:
-            print(f"\033[35mLoading Curriculum Agent from {ckpt_dir}/curriculum\033[0m")
+            logger.info(f"\033[35mLoading Curriculum Agent from {ckpt_dir}/curriculum\033[0m")
             self.completed_tasks = U.load_json(
                 f"{ckpt_dir}/curriculum/completed_tasks.json"
             )
@@ -54,6 +83,7 @@ class CurriculumAgent:
             self.completed_tasks = []
             self.failed_tasks = []
             self.qa_cache = {}
+        logger.info(f"\033[35mCurriculum Agent is using Chroma for QA cache.\033[0m")
         # vectordb for qa cache
         self.qa_cache_questions_vectordb = Chroma(
             collection_name="qa_cache_questions_vectordb",
@@ -234,7 +264,7 @@ class CurriculumAgent:
                 if should_include:
                     content += observation[key]
 
-        print(f"\033[35m****Curriculum Agent human message****\n{content}\033[0m")
+        logger.info(f"\033[35m****Curriculum Agent human message****\n{content}\033[0m")
         return HumanMessage(content=content)
 
     def propose_next_task(self, *, events, chest_observation, max_retries=5):
@@ -292,15 +322,16 @@ class CurriculumAgent:
     def propose_next_ai_task(self, *, messages, max_retries=5):
         if max_retries == 0:
             raise RuntimeError("Max retries reached, failed to propose ai task.")
-        curriculum = self.llm(messages).content
-        print(f"\033[31m****Curriculum Agent ai message****\n{curriculum}\033[0m")
+        curriculum_message = self.llm(messages)
+        curriculum = self._message_content_to_text(curriculum_message.content)
+        logger.info(f"\033[31m****Curriculum Agent ai message****\n{curriculum}\033[0m")
         try:
             response = self.parse_ai_message(curriculum)
             assert "next_task" in response
             context = self.get_task_context(response["next_task"])
             return response["next_task"], context
         except Exception as e:
-            print(
+            logger.info(
                 f"\033[35mError parsing curriculum response: {e}. Trying again!\033[0m"
             )
             return self.propose_next_ai_task(
@@ -322,7 +353,7 @@ class CurriculumAgent:
         while not confirmed:
             task = input("Enter task: ")
             context = input("Enter context: ")
-            print(f"Task: {task}\nContext: {context}")
+            logger.info(f"Task: {task}\nContext: {context}")
             confirmed = input("Confirm? (y/n)").lower() in ["y", ""]
         return task, context
 
@@ -332,10 +363,10 @@ class CurriculumAgent:
             # No need to record the deposit task
             return
         if info["success"]:
-            print(f"\033[35mCompleted task {task}.\033[0m")
+            logger.info(f"\033[35mCompleted task {task}.\033[0m")
             self.completed_tasks.append(task)
         else:
-            print(
+            logger.info(
                 f"\033[35mFailed to complete task {task}. Skipping to next task.\033[0m"
             )
             self.failed_tasks.append(task)
@@ -374,12 +405,15 @@ class CurriculumAgent:
             self.render_human_message(events=events, chest_observation=""),
             HumanMessage(content=f"Final task: {task}"),
         ]
-        print(
+        logger.info(
             f"\033[31m****Curriculum Agent task decomposition****\nFinal task: {task}\033[0m"
         )
-        response = self.llm(messages).content
-        print(f"\033[31m****Curriculum Agent task decomposition****\n{response}\033[0m")
-        return fix_and_parse_json(response)
+        response_message = self.llm(messages)
+        response_text = self._message_content_to_text(response_message.content)
+        logger.info(
+            f"\033[31m****Curriculum Agent task decomposition****\n{response_text}\033[0m"
+        )
+        return fix_and_parse_json(response_text)
 
     def run_qa(self, *, events, chest_observation):
         questions_new, _ = self.run_qa_step1_ask_questions(
@@ -459,7 +493,8 @@ class CurriculumAgent:
                 events=events, chest_observation=chest_observation
             ),
         ]
-        qa_response = self.qa_llm(messages).content
+        qa_response_message = self.qa_llm(messages)
+        qa_response = self._message_content_to_text(qa_response_message.content)
         try:
             # Regex pattern to extract question and concept pairs
             pattern = r"Question \d+: (.+)\nConcept \d+: (.+)"
@@ -472,7 +507,7 @@ class CurriculumAgent:
             questions.extend(questions_new)
             concepts.extend(concepts_new)
         except Exception as e:
-            print(
+            logger.info(
                 f"\033[35mError parsing curriculum response for "
                 f"QA step 1 ask questions: {e}.\033[0m"
             )
@@ -492,7 +527,51 @@ class CurriculumAgent:
             self.render_system_message_qa_step2_answer_questions(),
             self.render_human_message_qa_step2_answer_questions(question=question),
         ]
-        print(f"\033[35mCurriculum Agent Question: {question}\033[0m")
-        qa_answer = self.qa_llm(messages).content
-        print(f"\033[31mCurriculum Agent {qa_answer}\033[0m")
+        logger.info(f"\033[35mCurriculum Agent Question: {question}\033[0m")
+        qa_answer_message = self.qa_llm(messages)
+        qa_answer = self._message_content_to_text(qa_answer_message.content)
+        logger.info(f"\033[31mCurriculum Agent {qa_answer}\033[0m")
         return qa_answer
+
+    def _message_content_to_text(self, content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, str):
+                    parts.append(block)
+                elif isinstance(block, dict):
+                    text = block.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+            return "\n".join(parts)
+        return str(content)
+    
+    def test_yourself(self):
+        try:
+            logger.info("Curriculum Agent test_yourself called")
+            response = self.llm(
+                [
+                    self.render_system_message(),
+                    HumanMessage(content="Test yourself."),
+                ]
+            )
+        except Exception as e:
+            logger.error(f"Curriculum Agent test_yourself error: {e}")
+            return False
+        logger.info(f"Curriculum Agent test_yourself response: {response}")
+
+        try:
+            logger.info("Curriculum Agent test_yourself QA step called")
+            qa_response = self.qa_llm(
+                [
+                    self.render_system_message_qa_step1_ask_questions(),
+                    HumanMessage(content="Test yourself."),
+                ]
+            )
+        except Exception as e:
+            logger.error(f"Curriculum Agent test_yourself QA step error: {e}")
+            return False
+        logger.info(f"Curriculum Agent test_yourself QA response: {qa_response}")
+        return True

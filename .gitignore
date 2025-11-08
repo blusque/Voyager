@@ -127,3 +127,12 @@ debug_*
 logs/
 plot_iter.py
 *.svg
+
+# VS Code
+.vscode/
+
+# GitHub
+.github/
+
+# Env files
+.env*

@@ -1,37 +1,62 @@
 import os
+import re
+from typing import Any
 
 import voyager.utils as U
-from langchain.chat_models import ChatOpenAI
-from langchain.embeddings.openai import OpenAIEmbeddings
-from langchain.schema import HumanMessage, SystemMessage
-from langchain.vectorstores import Chroma
+from langchain_chroma import Chroma
+from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_qwq import ChatQwen
 
 from voyager.prompts import load_prompt
 from voyager.control_primitives import load_control_primitives
+from voyager.utils.telemetry import ensure_posthog_compat
 
+ensure_posthog_compat()
+
+logger = U.get_logger(__name__)
 
 class SkillManager:
     def __init__(
         self,
-        model_name="gpt-3.5-turbo",
+        model_name="qwen-plus",
         temperature=0,
         retrieval_top_k=5,
         request_timout=120,
         ckpt_dir="ckpt",
         resume=False,
     ):
-        self.llm = ChatOpenAI(
-            model_name=model_name,
-            temperature=temperature,
-            request_timeout=request_timout,
-        )
+        logger.info(f"Initializing SkillManager (model={model_name}, top_k={retrieval_top_k}, resume={resume})")
+        if re.search(r"^qwen-", model_name):
+            logger.info(
+                f"\033[32mUsing Qwen model {model_name} for Action Agent\033[0m"
+            )
+            self.llm = ChatQwen(
+                model_name=model_name,
+                temperature=temperature,
+                request_timeout=request_timout,
+            )
+        elif re.search(r"^gpt-", model_name):
+            logger.info(
+                f"\033[32mUsing GPT model {model_name} for Action Agent\033[0m"
+            )
+            self.llm = ChatOpenAI(
+                model_name=model_name,
+                temperature=temperature,
+                request_timeout=request_timout,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported model name {model_name} for Action Agent. "
+                "Please use a QwQ or GPT model."
+            )
         U.f_mkdir(f"{ckpt_dir}/skill/code")
         U.f_mkdir(f"{ckpt_dir}/skill/description")
         U.f_mkdir(f"{ckpt_dir}/skill/vectordb")
         # programs for env execution
         self.control_primitives = load_control_primitives()
         if resume:
-            print(f"\033[33mLoading Skill Manager from {ckpt_dir}/skill\033[0m")
+            logger.info(f"\033[33mLoading Skill Manager from {ckpt_dir}/skill\033[0m")
             self.skills = U.load_json(f"{ckpt_dir}/skill/skills.json")
         else:
             self.skills = {}
@@ -65,11 +90,11 @@ class SkillManager:
         program_name = info["program_name"]
         program_code = info["program_code"]
         skill_description = self.generate_skill_description(program_name, program_code)
-        print(
+        logger.info(
             f"\033[33mSkill Manager generated description for {program_name}:\n{skill_description}\033[0m"
         )
         if program_name in self.skills:
-            print(f"\033[33mSkill {program_name} already exists. Rewriting!\033[0m")
+            logger.info(f"\033[33mSkill {program_name} already exists. Rewriting!\033[0m")
             self.vectordb._collection.delete(ids=[program_name])
             i = 2
             while f"{program_name}V{i}.js" in os.listdir(f"{self.ckpt_dir}/skill/code"):
@@ -108,20 +133,56 @@ class SkillManager:
                 + f"The main function is `{program_name}`."
             ),
         ]
-        skill_description = f"    // { self.llm(messages).content}"
+        response = self.llm(messages)
+        description_text = self._message_content_to_text(response.content)
+        skill_description = f"    // {description_text}"
         return f"async function {program_name}(bot) {{\n{skill_description}\n}}"
 
     def retrieve_skills(self, query):
         k = min(self.vectordb._collection.count(), self.retrieval_top_k)
         if k == 0:
+            logger.debug("No skills available in vectordb")
             return []
-        print(f"\033[33mSkill Manager retrieving for {k} skills\033[0m")
+        logger.debug(f"Retrieving top {k} skills for query")
+        logger.info(f"\033[33mSkill Manager retrieving for {k} skills\033[0m")
         docs_and_scores = self.vectordb.similarity_search_with_score(query, k=k)
-        print(
+        skill_names = [doc.metadata['name'] for doc, _ in docs_and_scores]
+        logger.info(f"Retrieved skills: {', '.join(skill_names)}")
+        logger.info(
             f"\033[33mSkill Manager retrieved skills: "
-            f"{', '.join([doc.metadata['name'] for doc, _ in docs_and_scores])}\033[0m"
+            f"{', '.join(skill_names)}\033[0m"
         )
         skills = []
         for doc, _ in docs_and_scores:
             skills.append(self.skills[doc.metadata["name"]]["code"])
         return skills
+
+    def _message_content_to_text(self, content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, str):
+                    parts.append(block)
+                elif isinstance(block, dict):
+                    text = block.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+            return "\n".join(parts)
+        return str(content)
+    
+    def test_yourself(self):
+        try:
+            logger.info("Skill Manager test_yourself called")
+            response = self.llm(
+                [
+                    SystemMessage(content=load_prompt("skill_test")),
+                    HumanMessage(content="Test yourself."),
+                ]
+            )
+        except Exception as e:
+            logger.error(f"Skill Manager test_yourself error: {e}")
+            return False
+        logger.info(f"Skill Manager test_yourself response: {response}")
+        return True

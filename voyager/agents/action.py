@@ -3,18 +3,22 @@ import time
 
 import voyager.utils as U
 from javascript import require
-from langchain.chat_models import ChatOpenAI
-from langchain.prompts import SystemMessagePromptTemplate
-from langchain.schema import AIMessage, HumanMessage, SystemMessage
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from langchain_core.prompts import SystemMessagePromptTemplate
+from langchain_openai import ChatOpenAI
+from langchain_qwq import ChatQwen
 
 from voyager.prompts import load_prompt
 from voyager.control_primitives_context import load_control_primitives_context
 
+import re
+
+logger = U.get_logger(__name__)
 
 class ActionAgent:
     def __init__(
         self,
-        model_name="gpt-3.5-turbo",
+        model_name="gpt-4o",
         temperature=0,
         request_timout=120,
         ckpt_dir="ckpt",
@@ -27,15 +31,35 @@ class ActionAgent:
         self.execution_error = execution_error
         U.f_mkdir(f"{ckpt_dir}/action")
         if resume:
-            print(f"\033[32mLoading Action Agent from {ckpt_dir}/action\033[0m")
+            logger.info(f"\033[32mLoading Action Agent from {ckpt_dir}/action\033[0m")
             self.chest_memory = U.load_json(f"{ckpt_dir}/action/chest_memory.json")
         else:
             self.chest_memory = {}
-        self.llm = ChatOpenAI(
-            model_name=model_name,
-            temperature=temperature,
-            request_timeout=request_timout,
-        )
+        if re.search(r"^qwen-", model_name):
+            logger.info(
+                f"\033[32mUsing Qwen model {model_name} for Action Agent\033[0m"
+            )
+            self.llm = ChatQwen(
+                model_name=model_name,
+                temperature=temperature,
+                request_timeout=request_timout,
+            )
+        elif re.search(r"^gpt-", model_name):
+            logger.info(
+                f"\033[32mUsing GPT model {model_name} for Action Agent\033[0m"
+            )
+            self.llm = ChatOpenAI(
+                model_name=model_name,
+                temperature=temperature,
+                request_timeout=request_timout,
+            )
+        else:
+            raise ValueError(
+                f"Unsupported model name {model_name} for Action Agent. "
+                "Please use a QwQ or GPT model."
+            )
+        logger.info("Action Agent initialized successfully")
+        assert self.llm.api_base == "https://dashscope.aliyuncs.com/compatible-mode/v1", "Dashscope base URL mismatch"
 
     def update_chest_memory(self, chests):
         for position, chest in chests.items():
@@ -43,13 +67,13 @@ class ActionAgent:
                 if isinstance(chest, dict):
                     self.chest_memory[position] = chest
                 if chest == "Invalid":
-                    print(
+                    logger.info(
                         f"\033[32mAction Agent removing chest {position}: {chest}\033[0m"
                     )
                     self.chest_memory.pop(position)
             else:
                 if chest != "Invalid":
-                    print(f"\033[32mAction Agent saving chest {position}: {chest}\033[0m")
+                    logger.info(f"\033[32mAction Agent saving chest {position}: {chest}\033[0m")
                     self.chest_memory[position] = chest
         U.dump_json(self.chest_memory, f"{self.ckpt_dir}/action/chest_memory.json")
 
@@ -83,7 +107,7 @@ class ActionAgent:
             "smeltItem",
             "killMob",
         ]
-        if not self.llm.model_name == "gpt-3.5-turbo":
+        if not self.llm.model_name == "qwen-plus":
             base_skills += [
                 "useChest",
                 "mineflayer",
@@ -200,16 +224,16 @@ class ActionAgent:
 
     def process_ai_message(self, message):
         assert isinstance(message, AIMessage)
-
         retry = 3
-        error = None
+        error: Exception | None = None
         while retry > 0:
             try:
                 babel = require("@babel/core")
                 babel_generator = require("@babel/generator").default
 
                 code_pattern = re.compile(r"```(?:javascript|js)(.*?)```", re.DOTALL)
-                code = "\n".join(code_pattern.findall(message.content))
+                content = self._message_content_to_text(message)
+                code = "\n".join(code_pattern.findall(content))
                 parsed = babel.parse(code)
                 functions = []
                 assert len(list(parsed.program.body)) > 0, "No functions found"
@@ -255,6 +279,22 @@ class ActionAgent:
                 time.sleep(1)
         return f"Error parsing action response (before program execution): {error}"
 
+    def _message_content_to_text(self, message: AIMessage) -> str:
+        content = message.content
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, str):
+                    parts.append(block)
+                elif isinstance(block, dict):
+                    text = block.get("text")
+                    if isinstance(text, str):
+                        parts.append(text)
+            return "\n".join(parts)
+        return str(content)
+
     def summarize_chatlog(self, events):
         def filter_item(message: str):
             craft_pattern = r"I cannot make \w+ because I need: (.*)"
@@ -278,3 +318,18 @@ class ActionAgent:
                 if item:
                     chatlog.add(item)
         return "I also need " + ", ".join(chatlog) + "." if chatlog else ""
+    
+    def test_yourself(self):
+        try:
+            logger.info("Action Agent test_yourself called")
+            response = self.llm(
+                [
+                    self.render_system_message(),
+                    HumanMessage(content="Test yourself."),
+                ]
+            )
+        except Exception as e:
+            logger.error(f"Action Agent test_yourself error: {e}")
+            return False
+        logger.info(f"Action Agent test_yourself response: {response}")
+        return True

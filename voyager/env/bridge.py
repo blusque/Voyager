@@ -14,6 +14,8 @@ import voyager.utils as U
 from .minecraft_launcher import MinecraftInstance
 from .process_monitor import SubprocessMonitor
 
+logger = U.get_logger(__name__)
+
 
 class VoyagerEnv(gym.Env):
     def __init__(
@@ -25,9 +27,11 @@ class VoyagerEnv(gym.Env):
         request_timeout=600,
         log_path="./logs",
     ):
+        logger.info(f"Initializing VoyagerEnv (server_port={server_port}, timeout={request_timeout})")
         if not mc_port and not azure_login:
             raise ValueError("Either mc_port or azure_login must be specified")
         if mc_port and azure_login:
+            logger.warning("Both mc_port and azure_login specified, mc_port will be ignored")
             warnings.warn(
                 "Both mc_port and mc_login are specified, mc_port will be ignored"
             )
@@ -37,10 +41,14 @@ class VoyagerEnv(gym.Env):
         self.server_port = server_port
         self.request_timeout = request_timeout
         self.log_path = log_path
+        
+        logger.info("Starting Mineflayer process")
         self.mineflayer = self.get_mineflayer_process(server_port)
         if azure_login:
+            logger.info("Starting Minecraft instance with Azure login")
             self.mc_instance = self.get_mc_instance()
         else:
+            logger.info("Using existing Minecraft instance")
             self.mc_instance = None
         self.has_reset = False
         self.reset_options = None
@@ -62,7 +70,7 @@ class VoyagerEnv(gym.Env):
         )
 
     def get_mc_instance(self):
-        print("Creating Minecraft server")
+        logger.info("Creating Minecraft server")
         U.f_mkdir(self.log_path, "minecraft")
         return MinecraftInstance(
             **self.azure_login,

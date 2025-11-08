@@ -1,0 +1,1 @@
+This is a test prompt. After I ask you to "Test yourself", please respond with "Skill test passed".
